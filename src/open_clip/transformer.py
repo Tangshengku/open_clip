@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+from transformers.modeling_utils import prune_linear_layer, find_pruneable_heads_and_indices
 
 from .utils import to_2tuple
 from .pos_embed import get_2d_sincos_pos_embed
@@ -184,6 +185,145 @@ class AttentionalPooler(nn.Module):
         out = self.attn(q.unsqueeze(1).expand(-1, N, -1), x, x, need_weights=False)[0]
         return out.permute(1, 0, 2)  # LND -> NLD
 
+class MultiheadAttentionPrune(nn.MultiheadAttention):
+    def __init__(self, embed_dim, num_heads, dropout=0, 
+                 bias=True, add_bias_kv=False, add_zero_attn=False, 
+                 kdim=None, vdim=None, batch_first=False, device=None, dtype=None) -> None:
+        super().__init__(embed_dim, num_heads, dropout, bias, add_bias_kv, 
+                         add_zero_attn, kdim, vdim, batch_first, device, dtype)
+        self.embed_dim = embed_dim
+        self.pruned_heads = set()
+    
+    def prune_heads(self, heads):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_heads, self.head_dim, self.pruned_heads
+        )
+        prune_size = index.shape[0]
+        # Prune linear layers
+        new_weight = nn.Parameter(torch.zeros(prune_size*3, self.embed_dim, device=self.in_proj_weight.device))
+        new_bias = nn.Parameter(torch.zeros(prune_size*3, device=self.in_proj_weight.device))
+        new_weight[:prune_size], new_bias[:prune_size] = self.prune_weights(self.in_proj_weight[:self.embed_dim], self.in_proj_bias[:self.embed_dim], index)
+        new_weight[prune_size:2*prune_size], new_bias[prune_size:2*prune_size] = self.prune_weights(self.in_proj_weight[self.embed_dim:2*self.embed_dim], self.in_proj_bias[self.embed_dim:2*self.embed_dim], index)
+        new_weight[2*prune_size:3*prune_size], new_bias[2*prune_size:3*prune_size] = self.prune_weights(self.in_proj_weight[2*self.embed_dim:3*self.embed_dim],self.in_proj_bias[2*self.embed_dim:3*self.embed_dim], index)
+        self.in_proj_weight = new_weight
+        self.in_proj_bias = new_bias
+        self.out_proj = prune_linear_layer(self.out_proj, index, dim=1)
+        # self.out_proj.dense = prune_linear_layer(self.out_proj.dense, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(heads)
+        self.embed_dim = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+
+    def prune_weights(self, weight: nn.Parameter, bias: nn.Parameter, index: torch.LongTensor, dim: int = 0) -> nn.Linear:
+        """
+        Prune a linear layer to keep only entries in index.
+
+        Used to remove heads.
+
+        Args:
+            layer (`torch.nn.Linear`): The layer to prune.
+            index (`torch.LongTensor`): The indices to keep in the layer.
+            dim (`int`, *optional*, defaults to 0): The dimension on which to keep the indices.
+
+        Returns:
+            `torch.nn.Linear`: The pruned layer as a new layer with `requires_grad=True`.
+        """
+        index = index.to(weight.device)
+        W = weight.index_select(dim, index).clone().detach()
+        if bias is not None:
+            if dim == 1:
+                b = bias.clone().detach()
+            else:
+                b = bias[index].clone().detach()
+        return nn.Parameter(W.contiguous()), nn.Parameter(b.contiguous())
+    
+    def forward(self, query, key, value, key_padding_mask=None,
+                need_weights=True, attn_mask=None, average_attn_weights=True,
+                static_k=None, static_v=None,):
+        if self.batch_first:
+            if key is value:
+                if query is key:
+                    query = key = value = query.transpose(1, 0)
+                else:
+                    query, key = [x.transpose(1, 0) for x in (query, key)]
+                    value = key
+            else:
+                query, key, value = [x.transpose(1, 0) for x in (query, key, value)]
+        
+        q_tgt_len, bsz, q_embed_dim = query.shape
+        q, k, v = (torch.matmul(query, self.in_proj_weight.t()) + self.in_proj_bias) .chunk(3, dim=-1)
+        
+        if self.bias_k is not None and self.bias_v is not None:
+            assert self.static_k is None, "bias cannot be added to static key."
+            assert self.static_v is None, "bias cannot be added to static value."
+            k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
+            v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])
+            if attn_mask is not None:
+                attn_mask = torch.pad(attn_mask, (0, 1))
+            if key_padding_mask is not None:
+                key_padding_mask = torch.pad(key_padding_mask, (0, 1))
+        else:
+            assert self.bias_k is None
+            assert self.bias_v is None
+        
+        q = q.contiguous().view(q_tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        B, Nt, E = q.shape
+        
+        if static_k is None:
+            k = k.contiguous().view(k.shape[0], bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        else:
+            # TODO finish disentangling control flow so we don't do in-projections when statics are passed
+            assert static_k.size(0) == bsz * self.num_heads, \
+                f"expecting static_k.size(0) of {bsz * self.num_heads}, but got {static_k.size(0)}"
+            assert static_k.size(2) == self.head_dim, \
+                f"expecting static_k.size(2) of {self.head_dim}, but got {static_k.size(2)}"
+            k = static_k
+        if static_v is None:
+            v = v.contiguous().view(v.shape[0], bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        else:
+            # TODO finish disentangling control flow so we don't do in-projections when statics are passed
+            assert static_v.size(0) == bsz * self.num_heads, \
+                f"expecting static_v.size(0) of {bsz * self.num_heads}, but got {static_v.size(0)}"
+            assert static_v.size(2) == self.head_dim, \
+                f"expecting static_v.size(2) of {self.head_dim}, but got {static_v.size(2)}"
+            v = static_v
+
+        
+        src_len = k.size(1)
+        q_scaled = q / math.sqrt(E)
+        if attn_mask is not None:
+            attn_output_weights = torch.baddbmm(attn_mask, q_scaled, k.transpose(-2, -1))
+        else:
+            attn_output_weights = torch.bmm(q_scaled, k.transpose(-2, -1))
+        attn_output_weights = torch.softmax(attn_output_weights, dim=-1)
+        # if self.dropout_p > 0.0:
+        #     attn_output_weights = torch.dropout(attn_output_weights, p=self.dropout_p)
+
+        attn_output = torch.bmm(attn_output_weights, v)
+
+        attn_output = attn_output.transpose(0, 1).contiguous().view(q_tgt_len * bsz, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        # torch.matmul(attn_output, self.out_proj_weight.t())
+        attn_output = attn_output.view(q_tgt_len, bsz, attn_output.size(1))
+        if need_weights:
+        # optionally average attention weights over heads
+            attn_output_weights = attn_output_weights.view(bsz, self.num_heads, q_tgt_len, src_len)
+            if average_attn_weights:
+                attn_output_weights = attn_output_weights.sum(dim=1) / self.num_heads
+            # if not is_batched:
+            #     # squeeze the output if input was unbatched
+            #     attn_output = attn_output.squeeze(1)
+            #     attn_output_weights = attn_output_weights.squeeze(0)
+            return attn_output, attn_output_weights
+        else:
+            # if not is_batched:
+            #     # squeeze the output if input was unbatched
+            #     attn_output = attn_output.squeeze(1)
+            return attn_output, None
+          
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(
@@ -199,7 +339,7 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.ln_1 = norm_layer(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.attn = MultiheadAttentionPrune(d_model, n_head)
         self.ls_1 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
         if is_cross_attention:
             self.ln_1_kv = norm_layer(d_model)

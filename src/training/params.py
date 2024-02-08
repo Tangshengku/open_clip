@@ -452,6 +452,36 @@ def parse_args(args):
         action="store_true",
         help='Use SigLip (sigmoid) loss.'
     )
+    parser.add_argument(
+        "--do_ziplm_oneshot",
+        default=False,
+        action='store_true',
+        help="If true, will use ZipLM to one-shot prune the given model.",
+    )
+    parser.add_argument(
+        "--ziplm_target",
+        type=float,
+        default=1.0,
+        help="ZipLM target speedup."
+    )
+    parser.add_argument(
+        "--loader_batchsize",
+        type=int,
+        default=16,
+        help="Batch size for ZipLM dataloader"
+    )
+    parser.add_argument(
+        "--loader_nsamples",
+        type=int,
+        default=1024,
+        help="Number of samples to use for ZipLM dataloader"
+    )
+    parser.add_argument(
+        "--timing_file",
+        type=str,
+        default="bertbase_squad_V100.txt",
+        help="Path to timings for ZipLM pruning"
+    )
 
     args = parser.parse_args(args)
 

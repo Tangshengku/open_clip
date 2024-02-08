@@ -427,6 +427,15 @@ def main(args):
         evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
+    timing = True
+    if timing:
+        from training.timing import timing_main
+        timing_main(model, device, data['train'].dataloader, is_bert=True)
+
+    if args.do_ziplm_oneshot:
+        from training.ziplm import oneshot_prune
+        oneshot_prune(trainer, model, args.ziplm_target, args.loader_batchsize, args.loader_nsamples, args.timings_file)
+
     loss = create_loss(args)
 
     for epoch in range(start_epoch, args.epochs):
