@@ -192,8 +192,51 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         super().__init__(embed_dim, num_heads, dropout, bias, add_bias_kv, 
                          add_zero_attn, kdim, vdim, batch_first, device, dtype)
         self.embed_dim = embed_dim
+        # self._heads_num = num_heads
+        self.head_size = int(embed_dim / num_heads)
+        self.in_proj_linear_q = nn.Linear(embed_dim, embed_dim)
+        self.in_proj_linear_k = nn.Linear(embed_dim, embed_dim)
+        self.in_proj_linear_v = nn.Linear(embed_dim, embed_dim)
+        # q, k, v = self.in_proj_weight.data.chunk(3)
+        # q_b, k_b, v_b = self.in_proj_bias.data.chunk(3)
+        # self.in_proj_linear_q.weight.requires_grad = False
+        # self.in_proj_linear_k.weight.requires_grad = False
+        # self.in_proj_linear_v.weight.requires_grad = False
+
+        # self.in_proj_linear_q.weight.copy_(q.detach().clone().contiguous())
+        # self.in_proj_linear_k.weight.copy_(k.detach().clone().contiguous())
+        # self.in_proj_linear_v.weight.copy_(v.detach().clone().contiguous())
+        # self.in_proj_linear_q.weight.requires_grad = True
+        # self.in_proj_linear_k.weight.requires_grad = True
+        # self.in_proj_linear_v.weight.requires_grad = True
+
+        # self.in_proj_linear_q.bias.requires_grad = False
+        # self.in_proj_linear_k.bias.requires_grad = False
+        # self.in_proj_linear_v.bias.requires_grad = False
+        # self.in_proj_linear_q.bias.copy_(q_b.detach().clone().contiguous())
+        # self.in_proj_linear_k.bias.copy_(k_b.detach().clone().contiguous())
+        # self.in_proj_linear_v.bias.copy_(v_b.detach().clone().contiguous())
+        # self.in_proj_linear_q.bias.requires_grad = True
+        # self.in_proj_linear_k.bias.requires_grad = True
+        # self.in_proj_linear_v.bias.requires_grad = True
+
+        self.out_proj_linear = nn.Linear(embed_dim, embed_dim)
+        # self.out_proj_linear.weight.requires_grad = False
+        # self.out_proj_linear.bias.requires_grad = False
+        # self.out_proj_linear.weight.copy_(self.out_proj.weight.detach().clone().contiguous())
+        # self.out_proj_linear.bias.copy_(self.out_proj.bias.detach().clone().contiguous())
+        # self.out_proj_linear.weight.requires_grad = True
+        # self.out_proj_linear.bias.requires_grad = True
+
         self.pruned_heads = set()
     
+    # def sync(self):
+        # self.in_proj_weight = self.in_proj_linear.weight
+        # self.in_proj_bias = self.in_proj_linear.bias
+
+        # self.out_proj.weight = self.out_proj_linear.weight
+        # self.out_proj.bias = self.out_proj_linear.bias
+
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
@@ -202,14 +245,19 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         )
         prune_size = index.shape[0]
         # Prune linear layers
-        new_weight = nn.Parameter(torch.zeros(prune_size*3, self.embed_dim, device=self.in_proj_weight.device))
-        new_bias = nn.Parameter(torch.zeros(prune_size*3, device=self.in_proj_weight.device))
-        new_weight[:prune_size], new_bias[:prune_size] = self.prune_weights(self.in_proj_weight[:self.embed_dim], self.in_proj_bias[:self.embed_dim], index)
-        new_weight[prune_size:2*prune_size], new_bias[prune_size:2*prune_size] = self.prune_weights(self.in_proj_weight[self.embed_dim:2*self.embed_dim], self.in_proj_bias[self.embed_dim:2*self.embed_dim], index)
-        new_weight[2*prune_size:3*prune_size], new_bias[2*prune_size:3*prune_size] = self.prune_weights(self.in_proj_weight[2*self.embed_dim:3*self.embed_dim],self.in_proj_bias[2*self.embed_dim:3*self.embed_dim], index)
-        self.in_proj_weight = new_weight
-        self.in_proj_bias = new_bias
-        self.out_proj = prune_linear_layer(self.out_proj, index, dim=1)
+        # new_weight = nn.Parameter(torch.zeros(prune_size*3, self.embed_dim, device=self.in_proj_linear.weight.device))
+        # new_bias = nn.Parameter(torch.zeros(prune_size*3, device=self.in_proj_linear.weight.device))
+        # new_weight[:prune_size], new_bias[:prune_size] = self.prune_weights(self.in_proj_linear.weight[:self.embed_dim], self.in_proj_linear.bias[:self.embed_dim], index)
+        # new_weight[prune_size:2*prune_size], new_bias[prune_size:2*prune_size] = self.prune_weights(self.in_proj_linear.weight[self.embed_dim:2*self.embed_dim], self.in_proj_linear.bias[self.embed_dim:2*self.embed_dim], index)
+        # new_weight[2*prune_size:3*prune_size], new_bias[2*prune_size:3*prune_size] = self.prune_weights(self.in_proj_linear.weight[2*self.embed_dim:3*self.embed_dim],self.in_proj_linear.bias[2*self.embed_dim:3*self.embed_dim], index)
+        # self.in_proj_linear.weight = new_weight
+        # self.in_proj_linear.bias = new_bias
+        self.in_proj_linear_q = prune_linear_layer(self.in_proj_linear_q, index)
+        self.in_proj_linear_k = prune_linear_layer(self.in_proj_linear_k, index)
+        self.in_proj_linear_v = prune_linear_layer(self.in_proj_linear_v, index)
+
+
+        self.out_proj_linear = prune_linear_layer(self.out_proj_linear, index, dim=1)
         # self.out_proj.dense = prune_linear_layer(self.out_proj.dense, index, dim=1)
 
         # Update hyper params and store pruned heads
@@ -254,7 +302,8 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
                 query, key, value = [x.transpose(1, 0) for x in (query, key, value)]
         
         q_tgt_len, bsz, q_embed_dim = query.shape
-        q, k, v = (torch.matmul(query, self.in_proj_weight.t()) + self.in_proj_bias) .chunk(3, dim=-1)
+        # q, k, v = self.in_proj_linear(query).chunk(3, dim=-1)
+        q, k, v = self.in_proj_linear_q(query), self.in_proj_linear_k(query), self.in_proj_linear_v(query)
         
         if self.bias_k is not None and self.bias_v is not None:
             assert self.static_k is None, "bias cannot be added to static key."
@@ -305,9 +354,9 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         attn_output = torch.bmm(attn_output_weights, v)
 
         attn_output = attn_output.transpose(0, 1).contiguous().view(q_tgt_len * bsz, self.embed_dim)
-        attn_output = self.out_proj(attn_output)
+        attn_output = self.out_proj_linear(attn_output.view(q_tgt_len, bsz, attn_output.size(1)))
         # torch.matmul(attn_output, self.out_proj_weight.t())
-        attn_output = attn_output.view(q_tgt_len, bsz, attn_output.size(1))
+        # attn_output = attn_output.view(q_tgt_len, bsz, attn_output.size(1))
         if need_weights:
         # optionally average attention weights over heads
             attn_output_weights = attn_output_weights.view(bsz, self.num_heads, q_tgt_len, src_len)

@@ -3,12 +3,15 @@ import copy
 import numpy as np
 import random
 import torch
+import math
 from torch import nn
 from torch.nn import Module
+import webdataset as wds
 from transformers.modeling_utils import prune_linear_layer
+from training.timing import benchmark_foo
 
 
-def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
+def find_layers(module, layers=[nn.Linear], name=''):
     if type(module) in layers:
         return {name: module}
     res = {}
@@ -16,63 +19,87 @@ def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
         res.update(find_layers(child, layers=layers, name=name + '.' + name1 if name != '' else name1))
     return res
 
+def param_to_linear(weight, bias):
+    inp_dim, out_dim = weight.shape
+    layer = nn.Linear(out_dim, inp_dim, device=weight.device)
+    layer.weight = weight
+    layer.bias = bias
+    return layer
+
+def find_all_layer(module):
+    res = {}
+    for name, param in module.named_parameters():
+        if 'attn' in name and name.endswith('weight'):
+            name_bias, param_bias = next(iter(module.named_parameters()))
+            layer = param_to_linear(param, param_bias)
+            res.update({name.rstrip('.weight'): layer})
+        if 'mlp' in name and name.endswith('weight'):
+            name_bias, param_bias = next(iter(module.named_parameters()))
+            layer = param_to_linear(param, param_bias)
+            res.update({name.rstrip('.weight'): layer})
+    return res
+
+
 
 class NoAttention(Module):
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False
+        self, hidden_states
     ):
-        return (hidden_states,)
+        return hidden_states
 
+class NoAttentionOutput(Module):
+    def forward(self, hidden_states):
+        return hidden_states
 
 class NoIntermediate(Module):
+    def __init__(self, dtype) -> None:
+        super().__init__()
+        self.weight = torch.empty(1)
+        self.weight.to(dtype)
     def forward(self, hidden_states):
         return hidden_states
 
 
 class NoOutput(Module):
-    def forward(self, hidden_states, input_tensor):
+    def forward(self, input_tensor):
         return input_tensor
 
 
 def shrink(model):
-    bert = model.bert
-    for layer in bert.encoder.layer:
-        if not isinstance(layer.attention, NoAttention):
-            weight = layer.attention.output.dense.weight
+    visual = model
+    for layer in visual.transformer.resblocks:
+        if not isinstance(layer.attn, NoAttention):
+            weight = layer.attn.out_proj_linear.weight
             if torch.all(weight == 0):
-                layer.attention = NoAttention()
+                layer.attn.in_proj_linear_q = NoAttention()
+                layer.attn.in_proj_linear_k = NoAttention()
+                layer.attn.in_proj_linear_v = NoAttention()
+                layer.attn.out_proj_linear = NoAttentionOutput()
             else:
                 mask = torch.all(
-                    weight.t().reshape((-1, weight.shape[0] * layer.attention.self.attention_head_size)) == 0, 1
+                    weight.t().reshape((-1, weight.shape[0] * layer.attn.head_size)) == 0, 1
                 )
                 idx = []
                 count = 0
                 for i in range(mask.numel()):
-                    while count in layer.attention.pruned_heads:
+                    while count in layer.attn.pruned_heads:
                         count += 1
                     if mask[i]:
                         idx.append(count)
                     count += 1
                 if torch.any(mask):
-                    layer.attention.prune_heads(idx)
-        if not isinstance(layer.output, NoOutput):
-            weight = layer.output.dense.weight
+                    layer.attn.prune_heads(idx)
+        if not isinstance(layer.mlp[2], NoOutput):
+            weight = layer.mlp[2].weight
             if torch.all(weight == 0):
-                layer.intermediate = NoIntermediate()
-                layer.output = NoOutput()
+                layer.mlp[0] = NoIntermediate(weight.dtype)
+                layer.mlp[2] = NoOutput()
             else:
                 mask = torch.all(weight == 0, 0)
                 if torch.any(mask):
                     idx = torch.nonzero(~mask).flatten()
-                    layer.intermediate.dense = prune_linear_layer(layer.intermediate.dense, idx)
-                    layer.output.dense = prune_linear_layer(layer.output.dense, idx, dim=1)
+                    layer.mlp[0] = prune_linear_layer(layer.mlp[0], idx)
+                    layer.mlp[2] = prune_linear_layer(layer.mlp[2], idx, dim=1)
 
 
 class ZipLM:
@@ -89,7 +116,7 @@ class ZipLM:
         self.nsamples = 0
 
     def add_batch(self, inp, out):
-        tmp = inp.shape[0]
+        tmp = inp.shape[1]
         if isinstance(self.layer, nn.Linear):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
@@ -216,7 +243,7 @@ def gen_transformerdb(
     dataloader_passes=1,
     sparsities=[], min_sparsity=0, max_sparsity=.99, delta_sparse=.1,
     headcount=12, headsize=64, fcdim=4*768,
-    attname='attention.output.dense', fcname='output.dense'
+    attname='attn', fcname='mlp'
 ):
     modelp = get_model()
     modeld = get_model()
@@ -285,15 +312,18 @@ class StructuredSPDY:
         self,
         target,
         db, errors, baselinetime, prunabletime, timings,
-        get_model, run, dataloader,
+        get_model, run, dataloader, loss_fn=None, vision_prune=True,
         dpbuckets=10000,
     ):
         self.target = target
         self.db = db
         self.run = run
         self.dpbuckets = dpbuckets
-
-        self.modelp = get_model()
+        self.loss_fn = loss_fn
+        self.vision_prune = vision_prune
+        self.model = get_model()            
+        self.modelp = copy.deepcopy(self.model.visual if self.vision_prune else self.model.text)
+        
         self.layersp = find_layers(self.modelp)
 
         self.batches = []
@@ -322,7 +352,7 @@ class StructuredSPDY:
         for row in self.timings:
             for i in range(len(row)):
                 row[i] = int(round(row[i] / self.bucketsize))
-        print('Loss/Base:', self.get_loss(self.modelp))
+        print('Loss/Base:', self.get_loss(self.model))
 
     def dp(self, costs):
         DP = np.full((len(costs), self.dpbuckets + 1), float('inf'))
@@ -381,14 +411,18 @@ class StructuredSPDY:
     def get_loss(self, model):
         loss = 0
         for batch in self.batches:
-            loss += self.run(model, batch, loss=True)
+            loss += self.run(model, batch, loss=True, loss_fn=self.loss_fn)
         return loss / len(self.batches)
 
     def get_score(self, coefs):
         costs = self.gen_costs(coefs)
         solution = self.dp(costs)
         model = self.stitch_model(solution)
-        return self.get_loss(model)
+        if self.vision_prune:
+            self.model.visual = model
+        else:
+            self.model.text = model
+        return self.get_loss(self.model)
 
     def save_profile(self, coefs, filename=''):
         solution = self.dp(self.gen_costs(coefs))
@@ -428,7 +462,7 @@ class StructuredSPDY:
             self.save_profile(coefs, save)
 
     def search(
-        self, save='', randinits=10, searchsteps=10, muteprob=.1
+        self, save='', randinits=100, searchsteps=1000, muteprob=.1
     ):
         print('Random inits ...')
         candidates = []
@@ -574,8 +608,8 @@ def compute_squared(db, get_model, dataloader, run, filename):
     compute_pnorm(2, db, get_model, dataloader, run, filename)
 
 
-def _dataloader_builder(trainer, batchsize=16, nsamples=1024):
-    default_loader = trainer.get_train_dataloader()
+def _dataloader_builder(dataset, batchsize=256, nsamples=1024):
+    default_loader = dataset.dataloader
     template = dict(default_loader.__dict__)
 
     # drop attributes that will be auto-initialized
@@ -584,23 +618,25 @@ def _dataloader_builder(trainer, batchsize=16, nsamples=1024):
         template.pop(item)
 
     # shuffle dataset and select nsamples from it
-    shuffled_dataset = template['dataset'].shuffle(seed=42)
-    nsamples = len(shuffled_dataset) if nsamples == -1 else nsamples
-    shuffled_dataset = shuffled_dataset.select(range(nsamples))
-
+    # shuffled_dataset = template['dataset'].shuffle(seed=42)
+    # nsamples = len(shuffled_dataset) if nsamples == -1 else nsamples
+    # shuffled_dataset = shuffled_dataset.select(range(nsamples))
+    template["pipeline"][0].dataset.pipeline[-1] = wds.batched(batchsize, partial=False)
+    dataset_new = wds.DataPipeline(template["pipeline"][0].dataset.pipeline)
     kwargs = {
-        'batch_size': batchsize,
-        'dataset': shuffled_dataset,
-        'sampler': torch.utils.data.RandomSampler(shuffled_dataset)
+        'batch_size': None,
+        'dataset': dataset_new,
     }
     template.update(kwargs)
-    template.pop("gradient_state")
-    template.pop("iteration")
-    data_loader = type(default_loader)(**template)
+    data_loader = type(default_loader)(**kwargs)
 
-    for sample in data_loader:
-        sample = trainer._prepare_inputs(sample)
-        yield sample
+    data_loader.num_batches = math.ceil(nsamples / batchsize)
+    data_loader.num_samples = nsamples
+
+    for i, sample in  enumerate(data_loader):
+        # sample = dataloader._prepare_inputs(sample)
+        if (i + 1) * (batchsize) <= nsamples:
+            yield sample
 
 @torch.no_grad()
 def _get_model(module):
@@ -611,50 +647,94 @@ def _get_model(module):
     return foo
 
 @torch.no_grad()
-def _run_bert(model, batch, loss=False, retmoved=False):
+def _run_clip(model, batch, loss=False, retmoved=False, loss_fn=None):
     dev = next(iter(model.parameters())).device
-    for k, v in batch.items():
-        batch[k] = v.to(dev)
+    image, text = batch
+    text = text.to(dev)
+    image = image.to(dev)
+    # for k, v in batch.items():
+    #     batch[k] = v.to(dev)
     if retmoved:
         return batch
-    out = model(**batch)
-    if loss:
-        return out['loss'].item()
-    return torch.cat([out[key] for key in ['start_logits', 'end_logits']])
+    out = model(image, text)
+    if loss and loss_fn is not None:
+        out_loss = loss_fn(**out, output_dict=True)
+        return  sum(out_loss.values())
+    return out
+    # return torch.cat([out[key] for key in ['start_logits', 'end_logits']])
 
 @torch.no_grad()
-def oneshot_prune(trainer, module: Module, target: float, loader_batchsize: int, loader_nsamples: int, timings_file: str):
+def _run_clip_vit(model, batch, loss=False, retmoved=False, loss_fn=None):
+    dev = next(iter(model.parameters())).device
+    image, _ = batch
+    image = image.to(dev)
+    # for k, v in batch.items():
+    #     batch[k] = v.to(dev)
+    if retmoved:
+        return batch
+    out = model(image)
+    if loss and loss_fn is not None:
+        out_loss = loss_fn(**out, output_dict=True)
+        return  sum(out_loss.value())
+    return out
+
+@torch.no_grad()
+def _run_clip_text(model, batch, loss=False, retmoved=False, loss_fn=None):
+    dev = next(iter(model.parameters())).device
+    _, text = batch
+    text = text.to(dev)
+    # for k, v in batch.items():
+    #     batch[k] = v.to(dev)
+    if retmoved:
+        return batch
+    out = model(text)
+    if loss and loss_fn is not None:
+        out_loss = loss_fn(**out, output_dict=True)
+        return  sum(out_loss.value())
+    return out
+    # return torch.cat([out[key] for key in ['start_logits', 'end_logits']])
+
+
+@torch.no_grad()
+def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int, loader_nsamples: int, timings_file: str, loss=None, vision_prune=True):
     db_file = f'database_{target}.db'
+    if vision_prune:
+        model_p = module.visual
+    else:
+        model_p = module.text
+    headcount = model_p.transformer.resblocks[0].attn.num_heads
+    headsize = model_p.transformer.width // model_p.transformer.resblocks[0].attn.num_heads
+    fcdim = model_p.transformer.resblocks[0].mlp[0].out_features
 
     gen_transformerdb(
         db_file,
-        _get_model(module),
-        _run_bert,
+        _get_model(model_p),
+        _run_clip_vit if vision_prune else _run_clip_text,
         _dataloader_builder(
-            trainer,
+            dataset,
             batchsize=loader_batchsize,
             nsamples=loader_nsamples,
         ),
-        headcount=module.config.num_attention_heads,
-        headsize=module.config.hidden_size // module.config.num_attention_heads,
-        fcdim=module.config.intermediate_size if hasattr(module.config, 'intermediate_size') else module.config.hidden_size * 4,
-        attname='attention.output.dense',
-        fcname='output.dense',
+        headcount=headcount,
+        headsize=headsize,
+        fcdim=fcdim,
+        attname='attn.out_proj_linear',
+        fcname='mlp.c_proj',
     )
 
-    model = _get_model(module)()
+    model = _get_model(model_p)()
     db = StructDatabase(db_file, model)
 
     error_file = f'errors_squared_{target}.txt'
     compute_squared(
         db,
-        _get_model(module),
+        _get_model(model_p),
         _dataloader_builder(
-            trainer,
+            dataset,
             batchsize=loader_batchsize,
             nsamples=loader_nsamples,
         ),
-        _run_bert,
+        _run_clip_vit if vision_prune else _run_clip_text,
         error_file
     )
 
@@ -663,16 +743,28 @@ def oneshot_prune(trainer, module: Module, target: float, loader_batchsize: int,
 
     struct_spdy = StructuredSPDY(
         target, db, errors, baselinetime, prunabletime, timings,
-        _get_model(module), _run_bert,
+        _get_model(module), _run_clip,
         _dataloader_builder(
-            trainer,
+            dataset,
             batchsize=loader_batchsize,
             nsamples=loader_nsamples,
         ),
+        loss_fn=loss,
+        vision_prune=vision_prune
     )
 
     profile = f'profile_{target}.txt'
     struct_spdy.search(profile)
-    db.load_file(module, profile)
-    shrink(module)
+    db.load_file(model_p, profile)
+    # shrink(module.visual)
+    # for i in range(model_p.transformer.layers):
+    #     model_p.transformer.resblocks[i].attn.sync()
+
     os.remove(db_file)
+    test_speed = False
+    if test_speed:
+        dev = next(iter(module.parameters())).device
+        image_inputs, text_inputs = next(iter(dataset.dataloader))
+        image_inputs = image_inputs.to(dev)
+        mean, std = benchmark_foo(lambda: module.visual(image_inputs))
+        print("pruned speed: ", mean/1000)

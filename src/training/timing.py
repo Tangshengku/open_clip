@@ -45,29 +45,33 @@ def benchmark_foo(foo, repetitions=100, with_attn_cache=False, attn_cache_kwargs
 
 
 @torch.no_grad()
-def timing_main(model, device, data_loader, is_bert=True, debug=False, with_attn_cache=False, repetitions=50): # either BERT or GPT2
+def timing_main(model, device, data_loader, is_text=False, is_bert=True, debug=False, with_attn_cache=False, repetitions=50): # either BERT or GPT2
     # assume model and trainer are initialized from the main script
     model.to(device)
     model.eval()
-    sample_inputs, text_inputs = next(iter(data_loader))
-    sample_inputs = sample_inputs.to(device)
+    
     # sample_inputs = {k: v.to(device) for k, v in sample_inputs.items()}
     # for k, v in sample_inputs.items():
     #     print(f"{k} = {v.shape}")
-
-    image_base, attn_layer, prunable, layer = None, None, None, None
+    base_model, attn_layer, prunable, layer = None, None, None, None
+    image_inputs, text_inputs = next(iter(data_loader))
+    if is_text:
+        base_model = model.text
+        sample_inputs = text_inputs.to(device)
+    else:
+        base_model = model.visual
+        sample_inputs = image_inputs.to(device)
     if is_bert:
         # attn_layer = model.bert.encoder.layer[0].attention
         # prunable = model.bert.encoder
         # layer = model.bert.encoder.layer[0]
-        image_base = model.visual
-        attn_layer = model.visual.transformer.resblocks[0].attn
-        prunable = model.visual.transformer
-        layer = model.visual.transformer.resblocks[0]
+        attn_layer = base_model.transformer.resblocks[0].attn
+        prunable = base_model.transformer
+        layer = base_model.transformer.resblocks[0].mlp
     else:  # is_gpt2 :-)
-        attn_layer = model.transformer.h[0].attn
-        prunable = model.transformer.h
-        layer = model.transformer.h[0]
+        attn_layer = base_model.h[0].attn
+        prunable = base_model.h
+        layer = base_model.h[0]
 
     db_downscale = 1000  # 1000 for normal, I think 100 for text-gen
 
@@ -88,7 +92,7 @@ def timing_main(model, device, data_loader, is_bert=True, debug=False, with_attn
     else:
         prunable_hook = prunable[0].register_forward_hook(cache_inputs_factory(cached_inputs_outputs, prunable_dict_key))
     with torch.no_grad():
-        _ = image_base(sample_inputs)
+        _ = base_model(sample_inputs)
     attn_hook.remove()
     prunable_hook.remove()
     assert attn_dict_key + "_inputs" in cached_inputs_outputs.keys()
@@ -98,7 +102,7 @@ def timing_main(model, device, data_loader, is_bert=True, debug=False, with_attn
 
     # === benchmark entire model ===
     print("base")
-    t_mean, t_std = benchmark_foo(lambda: image_base(sample_inputs), repetitions=repetitions)
+    t_mean, t_std = benchmark_foo(lambda: base_model(sample_inputs), repetitions=repetitions)
     print(f"{t_mean/db_downscale:.4f}")
 
     # === benchmark prunable parts ===
@@ -123,7 +127,7 @@ def timing_main(model, device, data_loader, is_bert=True, debug=False, with_attn
         print(f"{t_mean/db_downscale:.4f}")
 
     # === benchmark attention layer ===
-    num_heads = 12
+    num_heads = base_model.transformer.resblocks[0].attn.num_heads
     # num_heads = model.config.num_attention_heads if is_bert else model.config.n_head
     print(f"[INFO] This model has num_heads={num_heads}")
     print("attention")
@@ -147,7 +151,7 @@ def timing_main(model, device, data_loader, is_bert=True, debug=False, with_attn
     # === benchmark ffn layer ===
     inter_size = None
     if is_bert:
-        inter_size = 3072
+        inter_size = base_model.transformer.resblocks[0].mlp[0].out_features
         # inter_size = model.config.intermediate_size if hasattr(model.config, 'intermediate_size') else model.config.hidden_size * 4
     else:  # is_gpt2
         inter_size = model.config.n_inner if hasattr(model.config, 'n_inner') and model.config.n_inner is not None else model.config.n_embd * 4
@@ -160,8 +164,8 @@ def timing_main(model, device, data_loader, is_bert=True, debug=False, with_attn
         idx = torch.arange(pruned_inter_dim)
 
         if is_bert:
-            layer.mlp[0] = prune_linear_layer(layer.mlp[0], idx)
-            layer.mlp[2] = prune_linear_layer(layer.mlp[2], idx, dim=1)
+            layer[0] = prune_linear_layer(layer[0], idx)
+            layer[2] = prune_linear_layer(layer[2], idx, dim=1)
             t_mean, t_std = benchmark_foo(lambda: layer(cached_inputs_outputs[attn_dict_key + "_outputs"][0]), repetitions=repetitions)
         else: # is_gpt2
             layer.mlp.c_fc = prune_conv1d_layer(layer.mlp.c_fc, idx, dim=1)

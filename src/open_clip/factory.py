@@ -11,7 +11,7 @@ import torch
 
 from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
-    resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg
+    resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg, convert_to_mha_prune_state_dict
 from .coca_model import CoCa
 from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss
 from .openai import load_openai_model
@@ -158,6 +158,7 @@ def load_checkpoint(model, checkpoint_path, strict=True):
         del state_dict[position_id_key]
     resize_pos_embed(state_dict, model)
     resize_text_pos_embed(state_dict, model)
+    state_dict=convert_to_mha_prune_state_dict(state_dict)
     incompatible_keys = model.load_state_dict(state_dict, strict=strict)
     return incompatible_keys
 
@@ -364,7 +365,7 @@ def create_model_and_transforms(
         device: Union[str, torch.device] = 'cpu',
         jit: bool = False,
         force_quick_gelu: bool = False,
-        force_custom_text: bool = False,
+        force_custom_text: bool = True,
         force_patch_dropout: Optional[float] = None,
         force_image_size: Optional[Union[int, Tuple[int, int]]] = None,
         image_mean: Optional[Tuple[float, ...]] = None,

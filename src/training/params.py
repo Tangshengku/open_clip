@@ -459,6 +459,12 @@ def parse_args(args):
         help="If true, will use ZipLM to one-shot prune the given model.",
     )
     parser.add_argument(
+        "--generate_timing_file",
+        default=False,
+        action='store_true',
+        help="If true, the timing file of models will be generated.",
+    )
+    parser.add_argument(
         "--ziplm_target",
         type=float,
         default=1.0,
@@ -467,7 +473,7 @@ def parse_args(args):
     parser.add_argument(
         "--loader_batchsize",
         type=int,
-        default=16,
+        default=256,
         help="Batch size for ZipLM dataloader"
     )
     parser.add_argument(
@@ -477,7 +483,13 @@ def parse_args(args):
         help="Number of samples to use for ZipLM dataloader"
     )
     parser.add_argument(
-        "--timing_file",
+        "--visual_timing_file",
+        type=str,
+        default="bertbase_squad_V100.txt",
+        help="Path to timings for ZipLM pruning"
+    )
+    parser.add_argument(
+        "--text_timing_file",
         type=str,
         default="bertbase_squad_V100.txt",
         help="Path to timings for ZipLM pruning"

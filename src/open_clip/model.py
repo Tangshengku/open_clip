@@ -446,6 +446,37 @@ def convert_to_custom_text_state_dict(state_dict: dict):
         return new_state_dict
     return state_dict
 
+def convert_to_mha_prune_state_dict(state_dict: dict):
+    new_dict = {}
+    for name, state in state_dict.items():
+        new_dict.update({name: state})
+        if name.endswith('in_proj_weight'):
+            name_q = name.replace('in_proj_weight', 'in_proj_linear_q.weight')
+            name_k = name.replace('in_proj_weight', 'in_proj_linear_k.weight')
+            name_v = name.replace('in_proj_weight', 'in_proj_linear_v.weight')
+            if name_q in state_dict.keys():
+                continue
+            q, k, v = state.chunk(3)
+            new_dict.update({name_q: q, name_k: k, name_v: v})
+        if name.endswith('in_proj_bias'):
+            name_q = name.replace('in_proj_bias', 'in_proj_linear_q.bias')
+            name_k = name.replace('in_proj_bias', 'in_proj_linear_k.bias')
+            name_v = name.replace('in_proj_bias', 'in_proj_linear_v.bias')
+            if name_q in state_dict.keys():
+                continue
+            q, k, v = state.chunk(3)
+            new_dict.update({name_q: q, name_k: k, name_v: v})
+        if name.endswith('out_proj.weight'):
+            name_out = name.replace('out_proj', 'out_proj_linear')
+            if name_out in state_dict.keys():
+                continue
+            new_dict.update({name_out: state})
+        if name.endswith('out_proj.bias'):
+            name_out = name.replace('out_proj', 'out_proj_linear')
+            if name_out in state_dict.keys():
+                continue
+            new_dict.update({name_out: state})
+    return new_dict
 
 def build_model_from_openai_state_dict(
         state_dict: dict,

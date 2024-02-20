@@ -153,3 +153,8 @@ core.*
 !src/evaluation/misc/results_dbs/*
 
 train.sh
+database*
+errors*
+benchmark*
+profile*
+CLIP_ViT_B_32/

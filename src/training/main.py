@@ -427,56 +427,75 @@ def main(args):
         evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
-    timing = True
+    timing = args.generate_timing_file
     if timing:
         from training.timing import timing_main
-        timing_main(model, device, data['train'].dataloader, is_bert=True)
-
-    if args.do_ziplm_oneshot:
-        from training.ziplm import oneshot_prune
-        oneshot_prune(trainer, model, args.ziplm_target, args.loader_batchsize, args.loader_nsamples, args.timings_file)
+        timing_main(model, device, data['train'].dataloader, is_bert=True, is_text=True, repetitions=100)
+        return 0
 
     loss = create_loss(args)
 
-    for epoch in range(start_epoch, args.epochs):
-        if is_master(args):
-            logging.info(f'Start epoch {epoch}')
+    if args.do_ziplm_oneshot:
+        from training.ziplm import oneshot_prune
+        oneshot_prune(data['train'], model, args.ziplm_target, args.loader_batchsize,
+                       args.loader_nsamples, args.visual_timing_file, loss=loss, vision_prune=True)
+        # oneshot_prune(data['train'], model, args.ziplm_target, args.loader_batchsize,
+        #                args.loader_nsamples, args.text_timing_file, loss=loss, vision_prune=False)
 
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
-        completed_epoch = epoch + 1
-
-        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
-
-        # Saving checkpoints.
         if args.save_logs:
             checkpoint_dict = {
-                "epoch": completed_epoch,
+                "epoch": start_epoch,
                 "name": args.name,
                 "state_dict": original_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
             }
             if scaler is not None:
-                checkpoint_dict["scaler"] = scaler.state_dict()
-
-            if completed_epoch == args.epochs or (
-                args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
-            ):
-                torch.save(
+                    checkpoint_dict["scaler"] = scaler.state_dict()
+            torch.save(
                     checkpoint_dict,
-                    os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
-                )
-            if args.delete_previous_checkpoint:
-                previous_checkpoint = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch - 1}.pt")
-                if os.path.exists(previous_checkpoint):
-                    os.remove(previous_checkpoint)
+                    os.path.join(args.checkpoint_path, f"epoch_{start_epoch}_pruned.pt"),
+                )       
 
-            if args.save_most_recent:
-                # try not to corrupt the latest checkpoint if save fails
-                tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
-                latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
-                torch.save(checkpoint_dict, tmp_save_path)
-                os.replace(tmp_save_path, latest_save_path)
+    if not args.do_ziplm_oneshot:
+        for epoch in range(start_epoch, args.epochs):
+            if is_master(args):
+                logging.info(f'Start epoch {epoch}')
+
+            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+            completed_epoch = epoch + 1
+
+            if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+                evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+
+            # Saving checkpoints.
+            if args.save_logs:
+                checkpoint_dict = {
+                    "epoch": completed_epoch,
+                    "name": args.name,
+                    "state_dict": original_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }
+                if scaler is not None:
+                    checkpoint_dict["scaler"] = scaler.state_dict()
+
+                if completed_epoch == args.epochs or (
+                    args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+                ):
+                    torch.save(
+                        checkpoint_dict,
+                        os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
+                    )
+                if args.delete_previous_checkpoint:
+                    previous_checkpoint = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch - 1}.pt")
+                    if os.path.exists(previous_checkpoint):
+                        os.remove(previous_checkpoint)
+
+                if args.save_most_recent:
+                    # try not to corrupt the latest checkpoint if save fails
+                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
+                    latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
+                    torch.save(checkpoint_dict, tmp_save_path)
+                    os.replace(tmp_save_path, latest_save_path)
 
     if args.wandb and is_master(args):
         wandb.finish()
