@@ -494,6 +494,12 @@ def parse_args(args):
         default="bertbase_squad_V100.txt",
         help="Path to timings for ZipLM pruning"
     )
+    parser.add_argument(
+        "--square_head",
+        default=False,
+        action='store_true',
+        help="If true, square head distill loss will be conducted.",
+    )
 
     args = parser.parse_args(args)
 

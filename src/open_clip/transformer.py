@@ -197,6 +197,14 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         self.in_proj_linear_q = nn.Linear(embed_dim, embed_dim)
         self.in_proj_linear_k = nn.Linear(embed_dim, embed_dim)
         self.in_proj_linear_v = nn.Linear(embed_dim, embed_dim)
+        self.in_proj_linear_q.mask = torch.zeros(1)
+        self.in_proj_linear_k.mask = torch.zeros(1)
+        self.in_proj_linear_v.mask = torch.zeros(1)
+        self.in_proj_linear_q.head_size = self.head_size
+        self.in_proj_linear_k.head_size = self.head_size
+        self.in_proj_linear_v.head_size = self.head_size
+        
+        
         # q, k, v = self.in_proj_weight.data.chunk(3)
         # q_b, k_b, v_b = self.in_proj_bias.data.chunk(3)
         # self.in_proj_linear_q.weight.requires_grad = False
@@ -221,6 +229,8 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         # self.in_proj_linear_v.bias.requires_grad = True
 
         self.out_proj_linear = nn.Linear(embed_dim, embed_dim)
+        self.out_proj_linear.mask = torch.zeros(1)
+        self.out_proj_linear.head_size = self.head_size
         # self.out_proj_linear.weight.requires_grad = False
         # self.out_proj_linear.bias.requires_grad = False
         # self.out_proj_linear.weight.copy_(self.out_proj.weight.detach().clone().contiguous())
@@ -229,13 +239,6 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         # self.out_proj_linear.bias.requires_grad = True
 
         self.pruned_heads = set()
-    
-    # def sync(self):
-        # self.in_proj_weight = self.in_proj_linear.weight
-        # self.in_proj_bias = self.in_proj_linear.bias
-
-        # self.out_proj.weight = self.out_proj_linear.weight
-        # self.out_proj.bias = self.out_proj_linear.bias
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -400,6 +403,8 @@ class ResidualAttentionBlock(nn.Module):
             ("gelu", act_layer()),
             ("c_proj", nn.Linear(mlp_width, d_model))
         ]))
+        self.mlp[0].mask = torch.zeros(1)
+        self.mlp[2].mask = torch.zeros(1)
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
 
     def attention(
@@ -504,14 +509,19 @@ class Transformer(nn.Module):
             return self.resblocks[0].mlp.c_fc.int8_original_dtype
         return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, out_hidden=False):
+        hidden_state = ()
         for r in self.resblocks:
+            hidden_state = hidden_state + (x,)
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
                 x = checkpoint(r, x, None, None, attn_mask)
             else:
                 x = r(x, attn_mask=attn_mask)
-        return x
+        if out_hidden:
+            return x, hidden_state
+        else:
+            return x
 
 
 class VisionTransformer(nn.Module):
@@ -654,6 +664,14 @@ class VisionTransformer(nn.Module):
 
             _unlock(groups[-unlocked_groups:])
 
+    @torch.no_grad()
+    def mask_weights(self):
+        def mask_(module):
+            if hasattr(module, 'mask'):
+                module.weight *= module.mask
+
+        self.apply(mask_)
+
     def init_parameters(self):
         # FIXME OpenAI CLIP did not define an init for the VisualTransformer
         # TODO experiment if default PyTorch init, below, or alternate init is best.
@@ -702,7 +720,7 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x, hidden_states = self.transformer(x, out_hidden=True)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         if self.attn_pool is not None:
@@ -733,7 +751,7 @@ class VisionTransformer(nn.Module):
         if self.output_tokens:
             return pooled, tokens
         
-        return pooled
+        return pooled, hidden_states
 
 
 def text_global_pool(x, text: Optional[torch.Tensor] = None, pool_type: str = 'argmax'):

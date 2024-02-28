@@ -65,7 +65,7 @@ class NoOutput(Module):
         return input_tensor
 
 
-def shrink(model):
+def shrink(model, update_mask=False):
     visual = model
     for layer in visual.transformer.resblocks:
         if not isinstance(layer.attn, NoAttention):
@@ -79,16 +79,26 @@ def shrink(model):
                 mask = torch.all(
                     weight.t().reshape((-1, weight.shape[0] * layer.attn.head_size)) == 0, 1
                 )
-                idx = []
-                count = 0
-                for i in range(mask.numel()):
-                    while count in layer.attn.pruned_heads:
+                if update_mask:
+                    mask_ = (~mask.unsqueeze(1)) * torch.ones_like(weight.t(), device=mask.device).reshape(
+                            (-1, weight.shape[0] * layer.attn.head_size)) 
+                    mask_ = mask_.reshape(-1, weight.shape[0])
+                    # mask_ = torch.ones_like(mask_, device=mask_.device)
+                    layer.attn.out_proj_linear.mask = mask_.t()
+                    layer.attn.in_proj_linear_q.mask = mask_
+                    layer.attn.in_proj_linear_k.mask = mask_
+                    layer.attn.in_proj_linear_v.mask = mask_
+                else:
+                    idx = []
+                    count = 0
+                    for i in range(mask.numel()):
+                        while count in layer.attn.pruned_heads:
+                            count += 1
+                        if mask[i]:
+                            idx.append(count)
                         count += 1
-                    if mask[i]:
-                        idx.append(count)
-                    count += 1
-                if torch.any(mask):
-                    layer.attn.prune_heads(idx)
+                    if torch.any(mask):
+                        layer.attn.prune_heads(idx)
         if not isinstance(layer.mlp[2], NoOutput):
             weight = layer.mlp[2].weight
             if torch.all(weight == 0):
@@ -96,7 +106,11 @@ def shrink(model):
                 layer.mlp[2] = NoOutput()
             else:
                 mask = torch.all(weight == 0, 0)
-                if torch.any(mask):
+                if update_mask:
+                    mask_ = (~mask.unsqueeze(0)) * torch.ones_like(weight, device=mask.device)
+                    layer.mlp[2].mask = mask_
+                    layer.mlp[0].mask = mask_.t()
+                elif torch.any(mask):
                     idx = torch.nonzero(~mask).flatten()
                     layer.mlp[0] = prune_linear_layer(layer.mlp[0], idx)
                     layer.mlp[2] = prune_linear_layer(layer.mlp[2], idx, dim=1)
@@ -516,6 +530,18 @@ class StructDatabase:
             return
         layers[name].weight.data = self.db[name][config]
         layers[name].bias.data = self.biases[name]
+        # if 'attn' in name:
+        #     mask = torch.all(
+        #                 layers[name].weight.t().reshape((-1, layers[name].weight.shape[0] * layers[name].head_size)) == 0, 1
+        #             )
+        #     mask_ = (~mask.unsqueeze(1)) * torch.ones_like(layers[name].weight.t(), device=mask.device).reshape(
+        #         (-1, layers[name].weight.shape[0] * layers[name].head_size)) 
+        #     mask_ = mask_.reshape(-1, layers[name].weight.shape[0])
+        #     layers[name].mask = mask_
+        # elif 'c_fc' in name:
+        #     mask = torch.all(layers[name].weight == 0, 0)
+        #     mask_ = (~mask.unsqueeze(1)) * torch.ones_like(layers[name].weight.t(), device=mask.device)
+
         if config == '1.0000':
             layers[name].bias.data = torch.zeros_like(layers[name].bias.data)
 
@@ -756,11 +782,21 @@ def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int,
     profile = f'profile_{target}.txt'
     struct_spdy.search(profile)
     db.load_file(model_p, profile)
-    # shrink(module.visual)
-    # for i in range(model_p.transformer.layers):
-    #     model_p.transformer.resblocks[i].attn.sync()
+    shrink(module.visual, update_mask=True)
 
-    os.remove(db_file)
+
+    # test_Dataloader = _dataloader_builder(
+    #         dataset,
+    #         batchsize=loader_batchsize,
+    #         nsamples=loader_nsamples,
+    #     )
+    # for batch in test_Dataloader:
+    #     test_image = batch[0].to(next(iter(module.parameters())).device)
+    #     res, _ = module.visual(test_image)
+    #     module.visual.mask_weights()
+    #     print(res.equal(module.visual(test_image)[0]))
+
+    # os.remove(db_file)
     test_speed = False
     if test_speed:
         dev = next(iter(module.parameters())).device

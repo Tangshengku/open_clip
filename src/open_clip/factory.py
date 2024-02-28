@@ -13,7 +13,7 @@ from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
     resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg, convert_to_mha_prune_state_dict
 from .coca_model import CoCa
-from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss
+from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, SquareHeadLoss
 from .openai import load_openai_model
 from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrained,\
     list_pretrained_tags_by_model, download_pretrained_from_hf
@@ -355,7 +355,7 @@ def create_loss(args):
         rank=args.rank,
         world_size=args.world_size,
         use_horovod=args.horovod,
-    )
+    ), SquareHeadLoss()
 
 
 def create_model_and_transforms(

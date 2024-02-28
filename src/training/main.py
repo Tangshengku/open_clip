@@ -433,8 +433,9 @@ def main(args):
         timing_main(model, device, data['train'].dataloader, is_bert=True, is_text=True, repetitions=100)
         return 0
 
-    loss = create_loss(args)
-
+    loss, square_head_loss = create_loss(args)
+    import copy
+    teacher_model = copy.deepcopy(model)
     if args.do_ziplm_oneshot:
         from training.ziplm import oneshot_prune
         oneshot_prune(data['train'], model, args.ziplm_target, args.loader_batchsize,
@@ -456,12 +457,14 @@ def main(args):
                     os.path.join(args.checkpoint_path, f"epoch_{start_epoch}_pruned.pt"),
                 )       
 
-    if not args.do_ziplm_oneshot:
+    if args.do_ziplm_oneshot:
+        # if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+        #         evaluate(model, data, 0, args, tb_writer=writer, tokenizer=tokenizer)
         for epoch in range(start_epoch, args.epochs):
             if is_master(args):
                 logging.info(f'Start epoch {epoch}')
 
-            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args, dist_model=teacher_model, square_head_loss=square_head_loss, tb_writer=writer)
             completed_epoch = epoch + 1
 
             if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):

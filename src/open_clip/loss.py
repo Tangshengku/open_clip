@@ -117,7 +117,7 @@ class ClipLoss(nn.Module):
         
         return logits_per_image, logits_per_text
 
-    def forward(self, image_features, text_features, logit_scale, output_dict=False):
+    def forward(self, image_features, text_features, logit_scale, image_hidden=None, output_dict=False):
         device = image_features.device
         logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
 
@@ -215,6 +215,39 @@ class DistillClipLoss(ClipLoss):
 
         return contrastive_loss, distill_loss
 
+class SquareHeadLoss(ClipLoss):
+    def __init__(self, hardness_squarehead=1.0, ):
+        super().__init__()
+        self.hardness_squarehead = hardness_squarehead
+    
+    def kldiv_loss(self, student_logits, teacher_logits, temperature=1.0):
+        "Kullback-Leibler divergence loss"
+        # num_tokens = student_logits.numel() / student_logits.size(-1)
+        num_tokens = student_logits.shape[0] * student_logits.shape[1]
+        return (
+            F.kl_div(
+                input=F.log_softmax(student_logits / temperature, dim=-1),
+                target=F.log_softmax(teacher_logits / temperature, dim=-1),
+                log_target=True,
+                reduction="sum",
+            )
+            * (temperature**2)
+            / num_tokens
+        )
+
+    def forward(self, teacher_states, student_states, kl_loss=False):
+        if kl_loss:
+            return self.kldiv_loss(student_states, teacher_states)
+        squarehead_loss = torch.tensor(0.0)
+        if self.hardness_squarehead > 0:
+                layerwise_losses = []
+                for i in range(1, len(teacher_states)):
+                    student_state = student_states[i]
+                    teacher_state = teacher_states[i]
+                    layerwise_losses.append(((student_state - teacher_state).pow(2).mean() / (teacher_state.pow(2).mean() + torch.finfo(torch.bfloat16).eps)))
+
+                squarehead_loss = self.hardness_squarehead * sum(layerwise_losses)
+        return squarehead_loss
 
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):
     tensor_recv = torch.zeros_like(tensor)

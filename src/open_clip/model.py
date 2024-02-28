@@ -263,8 +263,8 @@ class CLIP(nn.Module):
         self.transformer.grad_checkpointing = enable
 
     def encode_image(self, image, normalize: bool = False):
-        features = self.visual(image)
-        return F.normalize(features, dim=-1) if normalize else features
+        features, hidden_states = self.visual(image)
+        return F.normalize(features, dim=-1), hidden_states if normalize else features, hidden_states
 
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
@@ -299,14 +299,15 @@ class CLIP(nn.Module):
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
     ):
-        image_features = self.encode_image(image, normalize=True) if image is not None else None
+        image_features, image_hidden_states = self.encode_image(image, normalize=True) if image is not None else None
         text_features = self.encode_text(text, normalize=True) if text is not None else None
 
         if self.output_dict:
             out_dict = {
                 "image_features": image_features,
                 "text_features": text_features,
-                "logit_scale": self.logit_scale.exp()
+                "logit_scale": self.logit_scale.exp(),
+                "image_hidden": image_hidden_states
             }
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
@@ -356,8 +357,8 @@ class CustomTextCLIP(nn.Module):
         self.text.set_grad_checkpointing(enable)
 
     def encode_image(self, image, normalize: bool = False):
-        features = self.visual(image)
-        return F.normalize(features, dim=-1) if normalize else features
+        features, hidden_states = self.visual(image)
+        return (F.normalize(features, dim=-1), hidden_states) if normalize else (features, hidden_states)
 
     def encode_text(self, text, normalize: bool = False):
         features = self.text(text)
@@ -377,14 +378,15 @@ class CustomTextCLIP(nn.Module):
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
     ):
-        image_features = self.encode_image(image, normalize=True) if image is not None else None
+        image_features, image_hidden_states = self.encode_image(image, normalize=True) if image is not None else (None, None)
         text_features = self.encode_text(text, normalize=True) if text is not None else None
 
         if self.output_dict:
             out_dict = {
                 "image_features": image_features,
                 "text_features": text_features,
-                "logit_scale": self.logit_scale.exp()
+                "logit_scale": self.logit_scale.exp(),
+                "image_hidden": image_hidden_states
             }
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
