@@ -65,22 +65,32 @@ class NoOutput(Module):
         return input_tensor
 
 
-def shrink(model, update_mask=False):
+def shrink(model, update_mask=False, _print=False):
     visual = model
-    for layer in visual.transformer.resblocks:
+    for i, layer in enumerate(visual.transformer.resblocks):
         if not isinstance(layer.attn, NoAttention):
             weight = layer.attn.out_proj_linear.weight
             if torch.all(weight == 0):
-                layer.attn.in_proj_linear_q = NoAttention()
-                layer.attn.in_proj_linear_k = NoAttention()
-                layer.attn.in_proj_linear_v = NoAttention()
-                layer.attn.out_proj_linear = NoAttentionOutput()
+                if update_mask:
+                    mask_ = torch.zeros_like(weight.t(), device=weight.device)
+                    layer.attn.out_proj_linear.mask = mask_.t()
+                    layer.attn.in_proj_linear_q.mask = mask_
+                    layer.attn.in_proj_linear_k.mask = mask_
+                    layer.attn.in_proj_linear_v.mask = mask_
+                else:
+                    layer.attn.in_proj_linear_q = NoAttention()
+                    layer.attn.in_proj_linear_k = NoAttention()
+                    layer.attn.in_proj_linear_v = NoAttention()
+                    layer.attn.out_proj_linear = NoAttentionOutput()
             else:
                 mask = torch.all(
                     weight.t().reshape((-1, weight.shape[0] * layer.attn.head_size)) == 0, 1
                 )
                 if update_mask:
-                    mask_ = (~mask.unsqueeze(1)) * torch.ones_like(weight.t(), device=mask.device).reshape(
+                    if _print:
+                        print("layer.attn.out_proj_linear.weight: ", i)
+
+                    mask_ = (~mask.unsqueeze(1)) * torch.ones_like(weight.t(), device=weight.device).reshape(
                             (-1, weight.shape[0] * layer.attn.head_size)) 
                     mask_ = mask_.reshape(-1, weight.shape[0])
                     # mask_ = torch.ones_like(mask_, device=mask_.device)
@@ -97,24 +107,39 @@ def shrink(model, update_mask=False):
                         if mask[i]:
                             idx.append(count)
                         count += 1
+                    # print("head sparsity: ", len(idx)/layer.attn.num_heads, "  ", layer.attn.num_heads)
                     if torch.any(mask):
                         layer.attn.prune_heads(idx)
         if not isinstance(layer.mlp[2], NoOutput):
             weight = layer.mlp[2].weight
             if torch.all(weight == 0):
-                layer.mlp[0] = NoIntermediate(weight.dtype)
-                layer.mlp[2] = NoOutput()
+                if update_mask:
+                    mask_ = torch.zeros_like(weight, device=weight.device)
+                    layer.mlp[2].mask = mask_
+                    layer.mlp[0].mask = mask_.t()
+                else:
+                    layer.mlp[0] = NoIntermediate(weight.dtype)
+                    layer.mlp[2] = NoOutput()
             else:
                 mask = torch.all(weight == 0, 0)
                 if update_mask:
-                    mask_ = (~mask.unsqueeze(0)) * torch.ones_like(weight, device=mask.device)
+                    if _print:
+                        print("layer.mlp[0].weight: ",i,)
+                        print("layer.mlp[2].weight: ",i,)
+                    mask_ = (~mask.unsqueeze(0)) * torch.ones_like(weight, device=weight.device)
                     layer.mlp[2].mask = mask_
                     layer.mlp[0].mask = mask_.t()
                 elif torch.any(mask):
                     idx = torch.nonzero(~mask).flatten()
+                    # print("fc sparsity: ", 1 - len(idx)/weight.shape[1])
                     layer.mlp[0] = prune_linear_layer(layer.mlp[0], idx)
                     layer.mlp[2] = prune_linear_layer(layer.mlp[2], idx, dim=1)
 
+    if _print:
+        for i, layer in enumerate(visual.transformer.resblocks):
+            print("layer.attn.out_proj_linear.weight: ", i, '  ', layer.attn.out_proj_linear.weight.shape)
+            print("layer.mlp[0].weight: ",i, '  ', layer.mlp[0].weight.shape)
+            print("layer.mlp[2].weight: ",i, '  ', layer.mlp[2].weight.shape)
 
 class ZipLM:
     def __init__(self, layer):
@@ -366,6 +391,7 @@ class StructuredSPDY:
         for row in self.timings:
             for i in range(len(row)):
                 row[i] = int(round(row[i] / self.bucketsize))
+        
         print('Loss/Base:', self.get_loss(self.model))
 
     def dp(self, costs):
@@ -634,7 +660,7 @@ def compute_squared(db, get_model, dataloader, run, filename):
     compute_pnorm(2, db, get_model, dataloader, run, filename)
 
 
-def _dataloader_builder(dataset, batchsize=256, nsamples=1024):
+def _dataloader_builder(dataset, batchsize=256, nsamples=2048):
     default_loader = dataset.dataloader
     template = dict(default_loader.__dict__)
 
@@ -663,6 +689,8 @@ def _dataloader_builder(dataset, batchsize=256, nsamples=1024):
         # sample = dataloader._prepare_inputs(sample)
         if (i + 1) * (batchsize) <= nsamples:
             yield sample
+        else:
+            break
 
 @torch.no_grad()
 def _get_model(module):
@@ -684,7 +712,7 @@ def _run_clip(model, batch, loss=False, retmoved=False, loss_fn=None):
         return batch
     out = model(image, text)
     if loss and loss_fn is not None:
-        out_loss = loss_fn(**out, output_dict=True)
+        out_loss = loss_fn(**out, output_dict=True, gather=False)
         return  sum(out_loss.values())
     return out
     # return torch.cat([out[key] for key in ['start_logits', 'end_logits']])
@@ -722,7 +750,9 @@ def _run_clip_text(model, batch, loss=False, retmoved=False, loss_fn=None):
 
 
 @torch.no_grad()
-def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int, loader_nsamples: int, timings_file: str, loss=None, vision_prune=True):
+def oneshot_prune(args, dataset, module: Module, target: float, loader_batchsize: int, loader_nsamples: int, timings_file: str, loss=None, vision_prune=True):
+    if args.rank:
+        return
     db_file = f'database_{target}.db'
     if vision_prune:
         model_p = module.visual
@@ -731,6 +761,8 @@ def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int,
     headcount = model_p.transformer.resblocks[0].attn.num_heads
     headsize = model_p.transformer.width // model_p.transformer.resblocks[0].attn.num_heads
     fcdim = model_p.transformer.resblocks[0].mlp[0].out_features
+    db, errors, baselinetime, prunabletime, timings = None, None, None, None, None
+    profile = f'profile_{target}.txt'
 
     gen_transformerdb(
         db_file,
@@ -750,8 +782,8 @@ def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int,
 
     model = _get_model(model_p)()
     db = StructDatabase(db_file, model)
-
     error_file = f'errors_squared_{target}.txt'
+        
     compute_squared(
         db,
         _get_model(model_p),
@@ -767,6 +799,7 @@ def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int,
     errors = db.load_errors(error_file)
     baselinetime, prunabletime, timings = db.get_berttimings(timings_file)
 
+
     struct_spdy = StructuredSPDY(
         target, db, errors, baselinetime, prunabletime, timings,
         _get_model(module), _run_clip,
@@ -779,10 +812,9 @@ def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int,
         vision_prune=vision_prune
     )
 
-    profile = f'profile_{target}.txt'
     struct_spdy.search(profile)
-    db.load_file(model_p, profile)
-    shrink(module.visual, update_mask=True)
+    # db.load_file(model_p, profile)
+    # shrink(module.visual, update_mask=True, _print=True)
 
 
     # test_Dataloader = _dataloader_builder(
@@ -804,3 +836,26 @@ def oneshot_prune(dataset, module: Module, target: float, loader_batchsize: int,
         image_inputs = image_inputs.to(dev)
         mean, std = benchmark_foo(lambda: module.visual(image_inputs))
         print("pruned speed: ", mean/1000)
+
+@torch.no_grad()
+def load_pruned_model(module, target, vision_prune):
+    db_file = f'database_{target}.db'
+    if vision_prune:
+        model_p = module.visual
+    else:
+        model_p = module.text
+    
+    profile = f'profile_{target}.txt'
+
+    model = _get_model(model_p)()
+    db = StructDatabase(db_file, model)
+    
+    db.load_file(model_p, profile)
+    shrink(module.visual, update_mask=True, _print=True)
+
+def test_speed(module, dataset):
+    dev = next(iter(module.parameters())).device
+    image_inputs, text_inputs = next(iter(dataset.dataloader))
+    image_inputs = image_inputs.to(dev)
+    mean, std = benchmark_foo(lambda: module.visual(image_inputs))
+    print("pruned speed: ", mean/1000)

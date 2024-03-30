@@ -60,15 +60,20 @@ def backward(total_loss, scaler):
     else:
         total_loss.backward()
 
+def reduce_loss(loss):
+    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+    loss /= torch.distributed.get_world_size()
+    return loss
 
-def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args, dist_model, square_head_loss=None, tb_writer=None):
+def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args, dist_model, square_head_loss=None, clip_soft_loss=None, tb_writer=None):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision)
     input_dtype = get_input_dtype(args.precision)
-
+    if args.distributed:
+        model = model.module
     model.train()
     model.text.eval()
-    if args.distill or args.square_head:
+    if args.distill or args.square_head or args.clip_soft_loss:
         dist_model.eval()
 
     data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
@@ -102,8 +107,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
         if args.accum_freq == 1:
             square_loss = 0.0
             total_loss = 0.0
+            clip_soft_loss_ = 0.0
             with autocast():
                 model_out = model(images, texts)
+                model_out["text_features"] = model_out["text_features"].detach()
+                
                 logit_scale = model_out["logit_scale"]
                 if args.distill:
                     with torch.no_grad():
@@ -114,14 +122,21 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
                         dist_model_out = dist_model(images, texts)
                     square_loss = square_head_loss(dist_model_out["image_hidden"], model_out["image_hidden"]) + \
                                 square_head_loss(dist_model_out["image_features"], model_out["text_features"], kl_loss=True)
-                
+                    square_loss = reduce_loss(square_loss)
+
+                if args.clip_soft_loss:
+                    with torch.no_grad():
+                        dist_model_out = dist_model(images, texts)
+                    clip_soft_loss_ = clip_soft_loss(image_features=model_out["image_features"], text_features=model_out["text_features"],
+                teacher_image_features=dist_model_out["image_features"], teacher_text_features=dist_model_out["text_features"])
+                    # clip_soft_loss_ = reduce_loss(clip_soft_loss_)
+                    
                 # losses = loss(**model_out, output_dict=True)
 
-                total_loss = square_loss
+                total_loss = clip_soft_loss_
                 losses["loss"] = total_loss
                 torch.cuda.empty_cache()
             backward(total_loss, scaler)
-            model.visual.mask_weights()
         else:
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
@@ -199,6 +214,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
             unwrap_model(model).logit_scale.clamp_(0, math.log(100))
+
+        model.visual.mask_weights()
 
         batch_time_m.update(time.time() - end)
         end = time.time()

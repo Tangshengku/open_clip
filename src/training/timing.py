@@ -66,14 +66,14 @@ def timing_main(model, device, data_loader, is_text=False, is_bert=True, debug=F
         # prunable = model.bert.encoder
         # layer = model.bert.encoder.layer[0]
         attn_layer = base_model.transformer.resblocks[0].attn
-        prunable = base_model.transformer
+        prunable = base_model.transformer.resblocks
         layer = base_model.transformer.resblocks[0].mlp
     else:  # is_gpt2 :-)
         attn_layer = base_model.h[0].attn
         prunable = base_model.h
         layer = base_model.h[0]
 
-    db_downscale = 1000  # 1000 for normal, I think 100 for text-gen
+    db_downscale = 100  # 1000 for normal, I think 100 for text-gen
 
     # === cache inputs/outputs needed for timing ===
     cached_inputs_outputs = {}
@@ -87,7 +87,7 @@ def timing_main(model, device, data_loader, is_text=False, is_bert=True, debug=F
     attn_hook = attn_layer.register_forward_hook(cache_inputs_factory(cached_inputs_outputs, attn_dict_key))
     prunable_dict_key = "prunable"
     prunable_hook = None
-    if is_bert:
+    if False:
         prunable_hook = prunable.register_forward_hook(cache_inputs_factory(cached_inputs_outputs, prunable_dict_key))
     else:
         prunable_hook = prunable[0].register_forward_hook(cache_inputs_factory(cached_inputs_outputs, prunable_dict_key))
@@ -107,7 +107,7 @@ def timing_main(model, device, data_loader, is_text=False, is_bert=True, debug=F
 
     # === benchmark prunable parts ===
     print("prunable")
-    if is_bert:
+    if False:
         t_mean, t_std = benchmark_foo(lambda: prunable(*cached_inputs_outputs[prunable_dict_key + "_inputs"]), repetitions=repetitions)
     else: # is_gpt2
         # prunable is ModuleList
@@ -115,9 +115,10 @@ def timing_main(model, device, data_loader, is_text=False, is_bert=True, debug=F
             def run():
                 nonlocal x
                 for m in mlist:
-                    x = m(*x)
+                    x = m(x)
             return run
-        t_mean, t_std = benchmark_foo(fw_modulelist(prunable, cached_inputs_outputs[prunable_dict_key + "_inputs"]), repetitions=repetitions)
+        print(cached_inputs_outputs[prunable_dict_key + "_inputs"])
+        t_mean, t_std = benchmark_foo(fw_modulelist(prunable, cached_inputs_outputs[prunable_dict_key + "_inputs"][0]), repetitions=repetitions)
     print(f"{t_mean/db_downscale:.4f}")
 
     # === lm-head gpt2 ===
@@ -160,13 +161,14 @@ def timing_main(model, device, data_loader, is_text=False, is_bert=True, debug=F
     delta = .9
     sparsities = [1 - delta ** i for i in range(100) if delta ** i > .01]
     for sparsity in sparsities:
+        layer_ = deepcopy(layer)
         pruned_inter_dim = inter_size - round(inter_size * sparsity)
         idx = torch.arange(pruned_inter_dim)
 
         if is_bert:
-            layer[0] = prune_linear_layer(layer[0], idx)
-            layer[2] = prune_linear_layer(layer[2], idx, dim=1)
-            t_mean, t_std = benchmark_foo(lambda: layer(cached_inputs_outputs[attn_dict_key + "_outputs"][0]), repetitions=repetitions)
+            layer_[0] = prune_linear_layer(layer_[0], idx)
+            layer_[2] = prune_linear_layer(layer_[2], idx, dim=1)
+            t_mean, t_std = benchmark_foo(lambda: layer_(cached_inputs_outputs[attn_dict_key + "_outputs"][0]), repetitions=repetitions)
         else: # is_gpt2
             layer.mlp.c_fc = prune_conv1d_layer(layer.mlp.c_fc, idx, dim=1)
             layer.mlp.c_proj = prune_conv1d_layer(layer.mlp.c_proj, idx, dim=0)

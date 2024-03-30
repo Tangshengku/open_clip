@@ -197,9 +197,9 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         self.in_proj_linear_q = nn.Linear(embed_dim, embed_dim)
         self.in_proj_linear_k = nn.Linear(embed_dim, embed_dim)
         self.in_proj_linear_v = nn.Linear(embed_dim, embed_dim)
-        self.in_proj_linear_q.mask = torch.zeros(1)
-        self.in_proj_linear_k.mask = torch.zeros(1)
-        self.in_proj_linear_v.mask = torch.zeros(1)
+        self.in_proj_linear_q.mask = None
+        self.in_proj_linear_k.mask = None
+        self.in_proj_linear_v.mask = None
         self.in_proj_linear_q.head_size = self.head_size
         self.in_proj_linear_k.head_size = self.head_size
         self.in_proj_linear_v.head_size = self.head_size
@@ -229,7 +229,7 @@ class MultiheadAttentionPrune(nn.MultiheadAttention):
         # self.in_proj_linear_v.bias.requires_grad = True
 
         self.out_proj_linear = nn.Linear(embed_dim, embed_dim)
-        self.out_proj_linear.mask = torch.zeros(1)
+        self.out_proj_linear.mask = None
         self.out_proj_linear.head_size = self.head_size
         # self.out_proj_linear.weight.requires_grad = False
         # self.out_proj_linear.bias.requires_grad = False
@@ -428,13 +428,20 @@ class ResidualAttentionBlock(nn.Module):
             k_x: Optional[torch.Tensor] = None,
             v_x: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
+            return_hidden=False,
     ):
         k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
         v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
 
-        x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
-        x = x + self.ls_2(self.mlp(self.ln_2(x)))
-        return x
+        attn = self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask)
+        x = q_x + self.ls_1(attn)
+
+        mlp = self.mlp(self.ln_2(x))
+        x = x + self.ls_2(mlp)
+        if return_hidden:
+            return x, (attn)
+        else:
+            return x
 
 
 class CustomResidualAttentionBlock(nn.Module):
@@ -511,13 +518,16 @@ class Transformer(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, out_hidden=False):
         hidden_state = ()
+        attn = None
         for r in self.resblocks:
+            if attn is not None:
+                hidden_state = hidden_state + attn
             hidden_state = hidden_state + (x,)
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
                 x = checkpoint(r, x, None, None, attn_mask)
             else:
-                x = r(x, attn_mask=attn_mask)
+                x, attn = r(x, attn_mask=attn_mask, return_hidden=True)
         if out_hidden:
             return x, hidden_state
         else:

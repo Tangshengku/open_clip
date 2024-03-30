@@ -149,7 +149,7 @@ def parse_args(args):
         "--skip-scheduler",
         action="store_true",
         default=False,
-        help="Use this flag to skip the learning rate decay.",
+        help="Use this flag to skip the learning rate decay."
     )
     parser.add_argument(
         "--lr-scheduler",
@@ -496,6 +496,12 @@ def parse_args(args):
     )
     parser.add_argument(
         "--square_head",
+        default=False,
+        action='store_true',
+        help="If true, square head distill loss will be conducted.",
+    )
+    parser.add_argument(
+        "--clip_soft_loss",
         default=False,
         action='store_true',
         help="If true, square head distill loss will be conducted.",

@@ -158,3 +158,5 @@ errors*
 benchmark*
 profile*
 CLIP_ViT_B_32/
+*.sbatch
+slurm*

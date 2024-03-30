@@ -36,10 +36,21 @@ from training.params import parse_args
 from training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from training.train import train_one_epoch, evaluate
 from training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
-
+from training.ziplm import oneshot_prune, load_pruned_model, test_speed, shrink
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
+from contextlib import contextmanager
+@contextmanager
+def torch_distributed_zero_first(local_rank: int):
+    """
+    Decorator to make all processes in distributed training wait for each local_master to do something.
+    """
+    if local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+    yield
+    if local_rank == 0:
+        torch.distributed.barrier()
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
@@ -289,17 +300,17 @@ def main(args):
                 logging.info(f"  {name}: {val}")
                 f.write(f"{name}: {val}\n")
 
-    if args.distributed and not args.horovod:
-        if args.use_bn_sync:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        ddp_args = {}
-        if args.ddp_static_graph:
-            # this doesn't exist in older PyTorch, arg only added if enabled
-            ddp_args['static_graph'] = True
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
+    # if args.distributed and not args.horovod:
+    #     if args.use_bn_sync:
+    #         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    #     ddp_args = {}
+    #     if args.ddp_static_graph:
+    #         # this doesn't exist in older PyTorch, arg only added if enabled
+    #         ddp_args['static_graph'] = True
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
     
-        if args.distill:
-            dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
+    #     if args.distill:
+    #         dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
 
     # create optimizer and scaler
     optimizer = None
@@ -430,16 +441,36 @@ def main(args):
     timing = args.generate_timing_file
     if timing:
         from training.timing import timing_main
-        timing_main(model, device, data['train'].dataloader, is_bert=True, is_text=True, repetitions=100)
+        timing_main(model, device, data['train'].dataloader, is_bert=True, is_text=True, repetitions=1000)
         return 0
 
-    loss, square_head_loss = create_loss(args)
-    import copy
-    teacher_model = copy.deepcopy(model)
-    if args.do_ziplm_oneshot:
-        from training.ziplm import oneshot_prune
-        oneshot_prune(data['train'], model, args.ziplm_target, args.loader_batchsize,
-                       args.loader_nsamples, args.visual_timing_file, loss=loss, vision_prune=True)
+    loss, square_head_loss, clip_soft_loss = create_loss(args)
+    teacher_model = None
+    if args.square_head or args.clip_soft_loss:
+        import copy
+        teacher_model = copy.deepcopy(model)
+    
+    # if args.rank == 0:
+    #     shrink(model.visual, _print=True)
+    #     test_speed(model, data['train'])
+    # return
+    # if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+    #             evaluate(model, data, 10000, args, tb_writer=writer, tokenizer=tokenizer)
+    if args.resume:
+        shrink(model.visual, update_mask=True, _print=True)
+        torch.distributed.barrier()
+
+
+    if args.do_ziplm_oneshot  and not args.resume:
+        # if args.rank == 0:
+        #     oneshot_prune(args, data['train'], model, args.ziplm_target, args.loader_batchsize,
+        #                 args.loader_nsamples, args.visual_timing_file, loss=loss, vision_prune=True)
+        # # with torch_distributed_zero_first(args.local_rank):
+        load_pruned_model(model, args.ziplm_target, vision_prune=True)
+        torch.distributed.barrier()
+        # model.visual.mask_weights()
+        # shrink(model.visual, _print=True)
+        # torch.distributed.barrier()
         # oneshot_prune(data['train'], model, args.ziplm_target, args.loader_batchsize,
         #                args.loader_nsamples, args.text_timing_file, loss=loss, vision_prune=False)
 
@@ -456,15 +487,28 @@ def main(args):
                     checkpoint_dict,
                     os.path.join(args.checkpoint_path, f"epoch_{start_epoch}_pruned.pt"),
                 )       
+            
+    if args.distributed and not args.horovod:
+        if args.use_bn_sync:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        ddp_args = {}
+        if args.ddp_static_graph:
+            # this doesn't exist in older PyTorch, arg only added if enabled
+            ddp_args['static_graph'] = True
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
+    
+        if args.square_head:
+            teacher_model = torch.nn.parallel.DistributedDataParallel(teacher_model, device_ids=[device], **ddp_args)
+
 
     if args.do_ziplm_oneshot:
-        # if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-        #         evaluate(model, data, 0, args, tb_writer=writer, tokenizer=tokenizer)
+        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')) and not args.resume:
+                evaluate(model, data, 0, args, tb_writer=writer, tokenizer=tokenizer)
         for epoch in range(start_epoch, args.epochs):
             if is_master(args):
                 logging.info(f'Start epoch {epoch}')
 
-            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args, dist_model=teacher_model, square_head_loss=square_head_loss, tb_writer=writer)
+            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args, dist_model=teacher_model, square_head_loss=square_head_loss, clip_soft_loss=clip_soft_loss, tb_writer=writer)
             completed_epoch = epoch + 1
 
             if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):

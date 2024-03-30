@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from contextlib import nullcontext
 
 try:
     import torch.distributed.nn
@@ -62,6 +63,44 @@ def gather_features(
 
     return all_image_features, all_text_features
 
+def gather_feature(
+        image_features,
+        local_loss=False,
+        gather_with_grad=False,
+        rank=0,
+        world_size=1,
+        use_horovod=False
+):
+    if use_horovod:
+        assert hvd is not None, 'Please install horovod'
+        if gather_with_grad:
+            all_image_features = hvd.allgather(image_features)
+        else:
+            with torch.no_grad():
+                all_image_features = hvd.allgather(image_features)
+            if not local_loss:
+                # ensure grads for local rank when all_* features don't have a gradient
+                gathered_image_features = list(
+                    all_image_features.chunk(world_size, dim=0))
+                gathered_image_features[rank] = image_features
+                all_image_features = torch.cat(gathered_image_features, dim=0)
+    else:
+        # We gather tensors from all gpus
+        if gather_with_grad:
+            all_image_features = torch.cat(
+                torch.distributed.nn.all_gather(image_features), dim=0)
+        else:
+            gathered_image_features = [torch.zeros_like(
+                image_features) for _ in range(world_size)]
+            dist.all_gather(gathered_image_features, image_features)
+            if not local_loss:
+                # ensure grads for local rank when all_* features don't have a gradient
+                gathered_image_features[rank] = image_features
+            all_image_features = torch.cat(gathered_image_features, dim=0)
+
+    return all_image_features
+
+
 
 class ClipLoss(nn.Module):
 
@@ -86,11 +125,11 @@ class ClipLoss(nn.Module):
         self.prev_num_logits = 0
         self.labels = {}
 
-    def get_ground_truth(self, device, num_logits) -> torch.Tensor:
+    def get_ground_truth(self, device, num_logits, gather=True) -> torch.Tensor:
         # calculated ground-truth and cache if enabled
         if self.prev_num_logits != num_logits or device not in self.labels:
             labels = torch.arange(num_logits, device=device, dtype=torch.long)
-            if self.world_size > 1 and self.local_loss:
+            if self.world_size > 1 and self.local_loss and gather:
                 labels = labels + num_logits * self.rank
             if self.cache_labels:
                 self.labels[device] = labels
@@ -99,8 +138,8 @@ class ClipLoss(nn.Module):
             labels = self.labels[device]
         return labels
 
-    def get_logits(self, image_features, text_features, logit_scale):
-        if self.world_size > 1:
+    def get_logits(self, image_features, text_features, logit_scale, gather=True):
+        if self.world_size > 1 and gather:
             all_image_features, all_text_features = gather_features(
                 image_features, text_features,
                 self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
@@ -117,11 +156,11 @@ class ClipLoss(nn.Module):
         
         return logits_per_image, logits_per_text
 
-    def forward(self, image_features, text_features, logit_scale, image_hidden=None, output_dict=False):
+    def forward(self, image_features, text_features, logit_scale, gather=True, image_hidden=None, output_dict=False):
         device = image_features.device
-        logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
+        logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale, gather)
 
-        labels = self.get_ground_truth(device, logits_per_image.shape[0])
+        labels = self.get_ground_truth(device, logits_per_image.shape[0], gather)
 
         total_loss = (
             F.cross_entropy(logits_per_image, labels) +
@@ -216,7 +255,7 @@ class DistillClipLoss(ClipLoss):
         return contrastive_loss, distill_loss
 
 class SquareHeadLoss(ClipLoss):
-    def __init__(self, hardness_squarehead=1.0, ):
+    def __init__(self, hardness_squarehead=1.0,):
         super().__init__()
         self.hardness_squarehead = hardness_squarehead
     
@@ -248,6 +287,86 @@ class SquareHeadLoss(ClipLoss):
 
                 squarehead_loss = self.hardness_squarehead * sum(layerwise_losses)
         return squarehead_loss
+
+class ClipSoftLoss(nn.Module):
+    def __init__(
+            self,
+            local_loss=False,
+            gather_with_grad=False,
+            cache_labels=False,
+            rank=None,
+            world_size=None,
+            use_horovod=False,
+    ):
+        super().__init__()
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        if rank is None:
+            assert world_size is None
+            rank, world_size = dist.get_rank(), dist.get_world_size()
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+        assert self.local_loss
+
+        # cache state
+        self.feat_buffer = dict()
+
+    def compute_sim(self, image_features, text_features):
+        all_image_features = self.gather_feature(image_features)
+        all_text_features = self.gather_feature(text_features)
+
+        # calculate logits
+        # with torch.cuda.amp.autocast(enabled=False):
+        with nullcontext():
+            logits_per_image = image_features @ all_text_features.T
+            logits_per_text = text_features @ all_image_features.T
+        return logits_per_image, logits_per_text
+
+    def gather_feature(self, feat):
+        feat_id = id(feat)
+        if feat_id not in self.feat_buffer:
+            args = (self.local_loss, self.gather_with_grad,
+                    self.rank, self.world_size, self.use_horovod)
+            all_feat = gather_feature(feat, *args)
+            self.feat_buffer[feat_id] = all_feat
+        return self.feat_buffer[feat_id]
+
+    def forward(self,
+                image_features, text_features,
+                teacher_image_features, teacher_text_features, teacher_logit_scale=50, logit_scale=50,
+                average_two_losses=True,
+                labels=None,
+                ):
+        # calculated ground-truth and cache if enabled
+        logits_per_image, logits_per_text = self.compute_sim(
+            image_features, text_features)
+        teacher_logits_per_image, teacher_logits_per_text = self.compute_sim(
+            teacher_image_features, teacher_text_features)
+
+        self.feat_buffer.clear()
+
+        # with torch.cuda.amp.autocast(enabled=False):
+        with nullcontext():
+            logits_per_image = logit_scale * logits_per_image
+            logits_per_text = logit_scale * logits_per_text
+            teacher_logits_per_image = teacher_logit_scale * teacher_logits_per_image
+            teacher_logits_per_text = teacher_logit_scale * teacher_logits_per_text
+
+            def single_loss_fn(logits, teacher_logits):
+                teacher_probs = F.softmax(teacher_logits, -1)
+                return F.cross_entropy(logits, teacher_probs)
+
+            if average_two_losses:
+                total_loss = (single_loss_fn(logits_per_image, teacher_logits_per_image) +
+                              single_loss_fn(logits_per_text, teacher_logits_per_text)) / 2
+                return total_loss
+            else:
+                img2text_loss = single_loss_fn(
+                    logits_per_image, teacher_logits_per_image)
+                text2img_loss = single_loss_fn(
+                    logits_per_text, teacher_logits_per_text)
+                return img2text_loss, text2img_loss
 
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):
     tensor_recv = torch.zeros_like(tensor)
