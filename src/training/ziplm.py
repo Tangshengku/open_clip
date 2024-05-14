@@ -838,20 +838,20 @@ def oneshot_prune(args, dataset, module: Module, target: float, loader_batchsize
         print("pruned speed: ", mean/1000)
 
 @torch.no_grad()
-def load_pruned_model(module, target, vision_prune):
-    db_file = f'database_{target}.db'
+def load_pruned_model(module, db_file, profile, vision_prune):
+    # db_file = f'laion2b_e16/database_{target}_10000.db'
     if vision_prune:
         model_p = module.visual
     else:
         model_p = module.text
     
-    profile = f'profile_{target}.txt'
+    # profile = f'laion2b_e16/profile_{target}_10000.txt'
 
     model = _get_model(model_p)()
     db = StructDatabase(db_file, model)
     
     db.load_file(model_p, profile)
-    shrink(module.visual, update_mask=True, _print=True)
+    shrink(module.visual, update_mask=False, _print=True)
 
 def test_speed(module, dataset):
     dev = next(iter(module.parameters())).device

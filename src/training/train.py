@@ -72,7 +72,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
     if args.distributed:
         model = model.module
     model.train()
-    model.text.eval()
+    # model.text.eval()
     if args.distill or args.square_head or args.clip_soft_loss:
         dist_model.eval()
 
@@ -121,7 +121,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     square_loss = square_head_loss(dist_model_out["image_hidden"], model_out["image_hidden"]) + \
-                                square_head_loss(dist_model_out["image_features"], model_out["text_features"], kl_loss=True)
+                                square_head_loss(dist_model_out["image_features"], model_out["image_features"], kl_loss=True)
                     square_loss = reduce_loss(square_loss)
 
                 if args.clip_soft_loss:
@@ -131,9 +131,10 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
                 teacher_image_features=dist_model_out["image_features"], teacher_text_features=dist_model_out["text_features"])
                     # clip_soft_loss_ = reduce_loss(clip_soft_loss_)
                     
-                # losses = loss(**model_out, output_dict=True)
+                losses = loss(**model_out, output_dict=True)
 
-                total_loss = clip_soft_loss_
+                total_loss = sum(losses.values()) + square_loss
+                # total_loss = square_loss
                 losses["loss"] = total_loss
                 torch.cuda.empty_cache()
             backward(total_loss, scaler)
@@ -215,7 +216,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, args
         with torch.no_grad():
             unwrap_model(model).logit_scale.clamp_(0, math.log(100))
 
-        model.visual.mask_weights()
+        # model.visual.mask_weights()
 
         batch_time_m.update(time.time() - end)
         end = time.time()

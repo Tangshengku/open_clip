@@ -250,6 +250,12 @@ def main(args):
         output_dict=True,
         **model_kwargs,
     )
+    if args.resume:
+        # load_pruned_model(model, "laion2b_e16/database_1.1_10000.db", "laion2b_e16/profile_1.1_10000.txt", vision_prune=True)
+        load_pruned_model(model, "datacomp/database_1.2_10000.db", "datacomp/profile_1.2_10000.txt", vision_prune=True)
+        load_pruned_model(model, "datacomp/database_1.5_10000_from_1.2.db", "datacomp/profile_1.5_10000_from_1.2.txt", vision_prune=True)
+        # load_pruned_model(model, 1.4, vision_prune=True)
+        torch.distributed.barrier()
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
@@ -456,17 +462,19 @@ def main(args):
     # return
     # if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
     #             evaluate(model, data, 10000, args, tb_writer=writer, tokenizer=tokenizer)
-    if args.resume:
-        shrink(model.visual, update_mask=True, _print=True)
-        torch.distributed.barrier()
+    # if args.resume:
+    #     shrink(model.visual, update_mask=True, _print=True)
+    #     torch.distributed.barrier()
 
 
-    if args.do_ziplm_oneshot  and not args.resume:
+    if args.do_ziplm_oneshot and not args.resume:
         # if args.rank == 0:
         #     oneshot_prune(args, data['train'], model, args.ziplm_target, args.loader_batchsize,
         #                 args.loader_nsamples, args.visual_timing_file, loss=loss, vision_prune=True)
         # # with torch_distributed_zero_first(args.local_rank):
-        load_pruned_model(model, args.ziplm_target, vision_prune=True)
+        # load_pruned_model(model, 1.2, vision_prune=True)
+        # load_pruned_model(model, 1.3, vision_prune=True)
+        load_pruned_model(model, "datacomp/database_1.5_10000_from_1.2.db", "datacomp/profile_1.5_10000_from_1.2.txt", vision_prune=True)
         torch.distributed.barrier()
         # model.visual.mask_weights()
         # shrink(model.visual, _print=True)
@@ -502,7 +510,7 @@ def main(args):
 
 
     if args.do_ziplm_oneshot:
-        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')) and not args.resume:
+        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
                 evaluate(model, data, 0, args, tb_writer=writer, tokenizer=tokenizer)
         for epoch in range(start_epoch, args.epochs):
             if is_master(args):
